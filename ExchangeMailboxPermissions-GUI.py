@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Exchange Online - Postfachberechtigungen GUI v2.0
+Exchange Online - Postfachberechtigungen GUI v2.1
 Erstellt für Kaulich IT Systems GmbH
 
 Features:
@@ -8,10 +8,11 @@ Features:
 - Filterung nach Postfach-Typ (User/Shared/Beide)
 - Anzeige des Postfach-Typs in der Liste
 - Sichere Session-Verwaltung (kein dauerhaftes Login)
+- Automatische Prüfung & Installation von ExchangeOnlineManagement
 
 Voraussetzungen:
 - Windows mit PowerShell
-- ExchangeOnlineManagement Modul installiert
+- ExchangeOnlineManagement Modul wird automatisch installiert falls fehlend
 """
 
 import tkinter as tk
@@ -107,14 +108,17 @@ class PowerShellSession:
                 break
         
         # Eindeutiger End-Marker
-        end_marker = f"###END_{id(command)}###"
+        import time
+        end_marker = f"###END_{int(time.time() * 1000)}###"
+        error_marker = f"###ERROR_{int(time.time() * 1000)}###"
         
         # Befehl mit Error-Handling und End-Marker
+        # Fehler werden separat markiert, damit wir sie sauber erkennen
         wrapped_command = f"""
 try {{
     {command}
 }} catch {{
-    Write-Error $_.Exception.Message
+    Write-Output "{error_marker}$($_.Exception.Message)"
 }}
 Write-Output "{end_marker}"
 """
@@ -122,28 +126,35 @@ Write-Output "{end_marker}"
         
         # Auf Ausgabe warten
         output_lines = []
-        import time
+        error_lines = []
         start_time = time.time()
         
         while True:
             if time.time() - start_time > timeout:
-                return False, "", "Timeout"
+                return False, "", "Timeout - Befehl hat zu lange gedauert"
             
             try:
                 line = self.output_queue.get(timeout=0.5)
-                if end_marker in line:
+                stripped = line.rstrip()
+                
+                if end_marker in stripped:
                     break
-                output_lines.append(line.rstrip())
+                elif error_marker in stripped:
+                    # Fehlermeldung extrahieren (nach dem Marker)
+                    error_msg = stripped.split(error_marker, 1)[1] if error_marker in stripped else stripped
+                    error_lines.append(error_msg)
+                else:
+                    output_lines.append(stripped)
             except queue.Empty:
                 continue
         
         output = "\n".join(output_lines)
+        errors = "\n".join(error_lines)
         
-        # Prüfen ob Fehler aufgetreten
-        has_error = any("Error" in line or "Fehler" in line or "Exception" in line 
-                       for line in output_lines if line.strip())
+        if error_lines:
+            return False, output, errors
         
-        return not has_error, output, output if has_error else ""
+        return True, output, ""
     
     def stop(self):
         """PowerShell-Session beenden"""
@@ -181,20 +192,20 @@ class ModernButton(tk.Canvas):
     
     def _lighten_color(self, color):
         """Farbe aufhellen für Hover-Effekt"""
-        # Hex zu RGB
-        r = int(color[1:3], 16)
-        g = int(color[3:5], 16)
-        b = int(color[5:7], 16)
-        # Aufhellen
-        r = min(255, r + 30)
-        g = min(255, g + 30)
-        b = min(255, b + 30)
-        return f'#{r:02x}{g:02x}{b:02x}'
+        try:
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+            r = min(255, r + 30)
+            g = min(255, g + 30)
+            b = min(255, b + 30)
+            return f'#{r:02x}{g:02x}{b:02x}'
+        except:
+            return color
     
     def _draw_button(self, color):
         """Button zeichnen"""
         self.delete('all')
-        # Abgerundetes Rechteck
         radius = 8
         self.create_arc(0, 0, radius*2, radius*2, start=90, extent=90, 
                        fill=color, outline=color)
@@ -209,7 +220,6 @@ class ModernButton(tk.Canvas):
                              fill=color, outline=color)
         self.create_rectangle(0, radius, self.width, self.height-radius, 
                              fill=color, outline=color)
-        # Text
         text_color = self.fg_color if self.enabled else COLORS['text_muted']
         self.create_text(self.width/2, self.height/2, text=self.text, 
                         fill=text_color, font=('Segoe UI', 10, 'bold'))
@@ -219,7 +229,7 @@ class ModernButton(tk.Canvas):
             self._draw_button(self.hover_color)
     
     def _on_leave(self, event):
-        self._draw_button(self.bg_color if self.enabled else COLORS['text_muted'])
+        self._draw_button(self.bg_color if self.enabled else '#555555')
     
     def _on_click(self, event):
         if self.enabled and self.command:
@@ -241,8 +251,8 @@ class ModernButton(tk.Canvas):
 class ExchangePermissionsGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Exchange Online - Postfachberechtigungen v2.0")
-        self.root.geometry("620x720")
+        self.root.title("Exchange Online - Postfachberechtigungen v2.1")
+        self.root.geometry("620x750")
         self.root.resizable(False, False)
         self.root.configure(bg=COLORS['bg_dark'])
         
@@ -252,14 +262,17 @@ class ExchangePermissionsGUI:
         
         # Verbindungsstatus
         self.connected = False
-        self.all_mailboxes = []  # Alle Postfächer mit Typ-Info
-        self.filtered_mailboxes = []  # Gefilterte Liste für Anzeige
+        self.all_mailboxes = []
+        self.filtered_mailboxes = []
         
         # Filter-Einstellung
         self.mailbox_filter = tk.StringVar(value="all")
         
         self.create_widgets()
-        self.log("🚀 GUI gestartet - bereit für Verbindung", COLORS['success'])
+        self.log("🚀 GUI gestartet - prüfe Voraussetzungen...", COLORS['success'])
+        
+        # Automatisch Modul prüfen beim Start
+        self.root.after(500, self.check_and_install_module)
     
     def create_widgets(self):
         # Hauptframe
@@ -300,6 +313,11 @@ class ExchangePermissionsGUI:
         self.connect_btn = ModernButton(conn_inner, "🔌 Verbinden", 
                                         command=self.connect, width=130)
         self.connect_btn.grid(row=0, column=2)
+        
+        # Status-Label für Modulprüfung
+        self.module_status_label = tk.Label(conn_frame, text="⏳ Prüfe ExchangeOnlineManagement Modul...",
+                font=('Segoe UI', 9), fg=COLORS['warning'], bg=COLORS['bg_light'])
+        self.module_status_label.pack(fill=tk.X, padx=10, pady=(0, 5))
         
         # Hinweis: Kein dauerhaftes Login
         hint_frame = tk.Frame(conn_frame, bg=COLORS['bg_light'])
@@ -486,12 +504,10 @@ class ExchangePermissionsGUI:
         container = tk.Frame(parent, bg=COLORS['bg_dark'])
         container.pack(fill=tk.X, pady=(0, 10))
         
-        # Titel
         title_label = tk.Label(container, text=title, font=('Segoe UI', 11, 'bold'),
                               fg=COLORS['accent'], bg=COLORS['bg_dark'])
         title_label.pack(anchor=tk.W, pady=(0, 5))
         
-        # Frame mit Rahmen
         frame = tk.Frame(container, bg=COLORS['bg_light'],
                         highlightbackground=COLORS['bg_medium'],
                         highlightthickness=1)
@@ -503,7 +519,6 @@ class ExchangePermissionsGUI:
         """Nachricht ins Protokoll schreiben"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         
-        # Tag basierend auf Farbe bestimmen
         if color == COLORS['success']:
             tag = 'success'
         elif color == COLORS['error']:
@@ -520,6 +535,135 @@ class ExchangePermissionsGUI:
         self.log_text.insert(tk.END, f"{message}\n", tag)
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+    
+    # ============================================================
+    # MODUL-PRÜFUNG & INSTALLATION
+    # ============================================================
+    
+    def check_and_install_module(self):
+        """Prüft ob ExchangeOnlineManagement installiert ist und installiert es bei Bedarf"""
+        self.connect_btn.configure(state=tk.DISABLED)
+        self.log("🔍 Prüfe ExchangeOnlineManagement Modul...", COLORS['warning'])
+        
+        def do_check():
+            # Prüfen ob Modul vorhanden
+            check_cmd = '$m = Get-Module -ListAvailable -Name ExchangeOnlineManagement; if ($m) { Write-Output "INSTALLED:$($m.Version)" } else { Write-Output "NOT_INSTALLED" }'
+            success, stdout, stderr = self.ps.execute(check_cmd, timeout=30)
+            
+            output = stdout.strip()
+            
+            if "INSTALLED:" in output:
+                version = output.split("INSTALLED:")[1].strip().split("\n")[0]
+                self.root.after(0, lambda: self._module_found(version))
+            else:
+                self.root.after(0, self._module_not_found)
+        
+        thread = threading.Thread(target=do_check, daemon=True)
+        thread.start()
+    
+    def _module_found(self, version):
+        """Modul wurde gefunden"""
+        self.module_status_label.configure(
+            text=f"✅ ExchangeOnlineManagement v{version} installiert",
+            fg=COLORS['success']
+        )
+        self.connect_btn.configure(state=tk.NORMAL)
+        self.log(f"✅ ExchangeOnlineManagement v{version} gefunden", COLORS['success'])
+        self.log("🚀 Bereit für Verbindung!", COLORS['success'])
+    
+    def _module_not_found(self):
+        """Modul nicht gefunden - Installation anbieten"""
+        self.module_status_label.configure(
+            text="❌ ExchangeOnlineManagement fehlt!",
+            fg=COLORS['error']
+        )
+        self.log("❌ ExchangeOnlineManagement Modul nicht gefunden!", COLORS['error'])
+        
+        install = messagebox.askyesno(
+            "Modul fehlt",
+            "Das PowerShell-Modul 'ExchangeOnlineManagement' ist nicht installiert.\n\n"
+            "Dieses Modul wird für die Verbindung zu Exchange Online benötigt.\n\n"
+            "Soll es jetzt automatisch installiert werden?\n"
+            "(Benötigt ggf. Admin-Rechte)",
+            icon="warning"
+        )
+        
+        if install:
+            self._install_module()
+        else:
+            self.log("⚠️ Installation abgebrochen. Bitte manuell installieren:", COLORS['warning'])
+            self.log("   Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser", COLORS['accent'])
+            self.module_status_label.configure(
+                text="⚠️ Modul fehlt - bitte manuell installieren",
+                fg=COLORS['warning']
+            )
+    
+    def _install_module(self):
+        """ExchangeOnlineManagement Modul installieren"""
+        self.log("📦 Installiere ExchangeOnlineManagement...", COLORS['warning'])
+        self.log("   (Das kann 1-2 Minuten dauern)", COLORS['text_muted'])
+        self.module_status_label.configure(
+            text="⏳ Installiere ExchangeOnlineManagement... bitte warten",
+            fg=COLORS['warning']
+        )
+        self.root.update()
+        
+        def do_install():
+            # Erst NuGet Provider sicherstellen, dann Modul installieren
+            install_cmd = """
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
+Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -AcceptLicense
+$m = Get-Module -ListAvailable -Name ExchangeOnlineManagement
+if ($m) { Write-Output "INSTALL_OK:$($m.Version)" } else { Write-Output "INSTALL_FAILED" }
+"""
+            success, stdout, stderr = self.ps.execute(install_cmd, timeout=300)
+            
+            output = stdout.strip()
+            
+            if "INSTALL_OK:" in output:
+                version = output.split("INSTALL_OK:")[1].strip().split("\n")[0]
+                self.root.after(0, lambda: self._install_success(version))
+            else:
+                error_msg = stderr if stderr else "Unbekannter Fehler bei der Installation"
+                self.root.after(0, lambda: self._install_failed(error_msg))
+        
+        thread = threading.Thread(target=do_install, daemon=True)
+        thread.start()
+    
+    def _install_success(self, version):
+        """Installation erfolgreich"""
+        self.module_status_label.configure(
+            text=f"✅ ExchangeOnlineManagement v{version} erfolgreich installiert!",
+            fg=COLORS['success']
+        )
+        self.connect_btn.configure(state=tk.NORMAL)
+        self.log(f"✅ ExchangeOnlineManagement v{version} erfolgreich installiert!", COLORS['success'])
+        self.log("🚀 Bereit für Verbindung!", COLORS['success'])
+        messagebox.showinfo("Erfolg", 
+                           f"ExchangeOnlineManagement v{version} wurde erfolgreich installiert!\n\n"
+                           "Sie können jetzt eine Verbindung herstellen.")
+    
+    def _install_failed(self, error):
+        """Installation fehlgeschlagen"""
+        self.module_status_label.configure(
+            text="❌ Installation fehlgeschlagen!",
+            fg=COLORS['error']
+        )
+        self.log(f"❌ Installation fehlgeschlagen: {error}", COLORS['error'])
+        self.log("💡 Bitte manuell als Admin installieren:", COLORS['warning'])
+        self.log("   Install-Module -Name ExchangeOnlineManagement -Force", COLORS['accent'])
+        
+        messagebox.showerror("Installation fehlgeschlagen", 
+                            f"Die Installation ist fehlgeschlagen.\n\n"
+                            f"Fehler: {error}\n\n"
+                            "Bitte öffnen Sie PowerShell als Administrator und führen Sie aus:\n"
+                            "Install-Module -Name ExchangeOnlineManagement -Force")
+    
+    # ============================================================
+    # VERBINDUNG
+    # ============================================================
     
     def toggle_automapping(self):
         """AutoMapping Checkbox aktivieren/deaktivieren"""
@@ -558,19 +702,30 @@ class ExchangePermissionsGUI:
             return
         
         self.log("🔄 Verbinde zu Exchange Online...", COLORS['warning'])
+        self.log("   (Browser-Fenster für Anmeldung öffnet sich...)", COLORS['text_muted'])
         self.connect_btn.configure(state=tk.DISABLED)
         self.root.update()
         
         def do_connect():
-            # Explizit KEIN dauerhaftes Token speichern
             cmd = f'Connect-ExchangeOnline -UserPrincipalName "{admin}" -ShowBanner:$false'
             success, stdout, stderr = self.ps.execute(cmd, timeout=180)
-            self.root.after(0, lambda: self.connect_callback(success, stderr))
+            
+            # Zusätzliche Prüfung: Versuche einen einfachen Befehl auszuführen
+            if success:
+                verify_cmd = 'Get-OrganizationConfig | Select-Object -ExpandProperty Name'
+                v_success, v_stdout, v_stderr = self.ps.execute(verify_cmd, timeout=30)
+                if v_success and v_stdout.strip():
+                    org_name = v_stdout.strip().split("\n")[0]
+                    self.root.after(0, lambda: self.connect_callback(True, "", org_name))
+                else:
+                    self.root.after(0, lambda: self.connect_callback(True, "", ""))
+            else:
+                self.root.after(0, lambda: self.connect_callback(False, stderr, ""))
         
         thread = threading.Thread(target=do_connect)
         thread.start()
     
-    def connect_callback(self, success, error):
+    def connect_callback(self, success, error, org_name=""):
         """Callback nach Verbindungsversuch"""
         self.connect_btn.configure(state=tk.NORMAL)
         
@@ -578,14 +733,19 @@ class ExchangePermissionsGUI:
             self.connected = True
             self.connect_btn.configure(text="✅ Verbunden", bg=COLORS['success'])
             self.refresh_btn.configure(state=tk.NORMAL)
-            self.log("✅ Verbindung hergestellt!", COLORS['success'])
+            
+            if org_name:
+                self.log(f"✅ Verbunden mit: {org_name}", COLORS['success'])
+            else:
+                self.log("✅ Verbindung hergestellt!", COLORS['success'])
+            
             messagebox.showinfo("Verbunden", 
                               "Erfolgreich mit Exchange Online verbunden!\n\n"
                               "Postfächer werden jetzt geladen...")
             self.load_mailboxes()
         else:
-            self.log(f"❌ FEHLER: {error}", COLORS['error'])
-            messagebox.showerror("Fehler", f"Verbindung fehlgeschlagen:\n{error}")
+            self.log(f"❌ Verbindung fehlgeschlagen: {error}", COLORS['error'])
+            messagebox.showerror("Fehler", f"Verbindung fehlgeschlagen:\n\n{error}")
     
     def load_mailboxes(self):
         """Alle Postfächer von Exchange Online laden"""
@@ -595,8 +755,7 @@ class ExchangePermissionsGUI:
         self.user_combo.set("⏳ Lade...")
         
         def do_load():
-            # Lädt ALLE Postfächer mit Typ-Information
-            cmd = '''Get-Mailbox -ResultSize Unlimited | Select-Object DisplayName, PrimarySmtpAddress, RecipientTypeDetails | ConvertTo-Json -Compress'''
+            cmd = 'Get-Mailbox -ResultSize Unlimited | Select-Object DisplayName, PrimarySmtpAddress, RecipientTypeDetails | ConvertTo-Json -Compress'
             success, stdout, stderr = self.ps.execute(cmd, timeout=180)
             self.root.after(0, lambda: self.load_mailboxes_callback(success, stdout, stderr))
         
@@ -609,12 +768,11 @@ class ExchangePermissionsGUI:
         
         if success and stdout.strip():
             try:
-                # JSON aus Output extrahieren
                 json_start = stdout.find('[')
                 json_start_obj = stdout.find('{')
                 
                 if json_start == -1 and json_start_obj == -1:
-                    raise ValueError("Kein JSON gefunden")
+                    raise ValueError("Kein JSON in der Ausgabe gefunden")
                 
                 if json_start == -1 or (json_start_obj != -1 and json_start_obj < json_start):
                     json_start = json_start_obj
@@ -651,10 +809,7 @@ class ExchangePermissionsGUI:
                             'type': 'shared' if is_shared else 'user'
                         })
                 
-                # Sortieren
                 self.all_mailboxes.sort(key=lambda x: x['display'])
-                
-                # Filter anwenden
                 self.apply_filter()
                 
                 self.log(f"✅ {len(self.all_mailboxes)} Postfächer geladen "
@@ -662,11 +817,12 @@ class ExchangePermissionsGUI:
                         COLORS['success'])
                 
             except (json.JSONDecodeError, ValueError) as e:
-                self.log(f"❌ FEHLER beim Parsen: {e}", COLORS['error'])
+                self.log(f"❌ Fehler beim Parsen der Postfächer: {e}", COLORS['error'])
                 self.mailbox_combo.set("-- Fehler --")
                 self.user_combo.set("-- Fehler --")
         else:
-            self.log(f"❌ FEHLER: {stderr}", COLORS['error'])
+            error_msg = stderr if stderr else "Keine Daten empfangen"
+            self.log(f"❌ Fehler beim Laden: {error_msg}", COLORS['error'])
             self.mailbox_combo.set("-- Fehler --")
             self.user_combo.set("-- Fehler --")
     
@@ -681,7 +837,6 @@ class ExchangePermissionsGUI:
         elif filter_type == "shared":
             self.filtered_mailboxes = [mb for mb in self.all_mailboxes if mb['type'] == 'shared']
         
-        # Dropdown aktualisieren
         display_list = [mb['display'] for mb in self.filtered_mailboxes]
         
         self.mailbox_combo.configure(values=display_list, state="normal")
@@ -689,14 +844,13 @@ class ExchangePermissionsGUI:
         self.mailbox_combo.set("")
         self.user_combo.set("")
         
-        self.log(f"🔍 Filter angewendet: {len(self.filtered_mailboxes)} Postfächer", COLORS['accent'])
+        self.log(f"🔍 Filter: {len(self.filtered_mailboxes)} Postfächer angezeigt", COLORS['accent'])
     
     def filter_mailboxes(self, event=None):
         """Postfächer nach Suchbegriff filtern"""
         search_term = self.search_entry.get().lower()
         filter_type = self.mailbox_filter.get()
         
-        # Erst nach Typ filtern
         if filter_type == "all":
             type_filtered = self.all_mailboxes
         elif filter_type == "user":
@@ -704,14 +858,12 @@ class ExchangePermissionsGUI:
         else:
             type_filtered = [mb for mb in self.all_mailboxes if mb['type'] == 'shared']
         
-        # Dann nach Suchbegriff
         if search_term:
             filtered = [mb for mb in type_filtered if search_term in mb['display'].lower()]
         else:
             filtered = type_filtered
         
         display_list = [mb['display'] for mb in filtered]
-        
         self.mailbox_combo.configure(values=display_list)
         self.user_combo.configure(values=display_list)
     
@@ -768,7 +920,7 @@ class ExchangePermissionsGUI:
         
         if errors:
             for error in errors:
-                self.log(f"❌ FEHLER: {error}", COLORS['error'])
+                self.log(f"❌ {error}", COLORS['error'])
             messagebox.showerror("Fehler", 
                                "Einige Berechtigungen konnten nicht hinzugefügt werden.\n"
                                "Siehe Protokoll für Details.")
@@ -826,7 +978,7 @@ class ExchangePermissionsGUI:
         
         if errors:
             for error in errors:
-                self.log(f"❌ FEHLER: {error}", COLORS['error'])
+                self.log(f"❌ {error}", COLORS['error'])
             messagebox.showerror("Fehler", 
                                "Einige Berechtigungen konnten nicht entfernt werden.\n"
                                "Siehe Protokoll für Details.")
@@ -860,7 +1012,6 @@ class ExchangePermissionsGUI:
         """Aufräumen beim Beenden - Session wird IMMER getrennt"""
         self.log("🧹 Räume auf und trenne Session...", COLORS['warning'])
         try:
-            # IMMER Verbindung trennen - kein dauerhaftes Login!
             self.ps.execute("Disconnect-ExchangeOnline -Confirm:$false", timeout=10)
         except:
             pass
@@ -870,7 +1021,6 @@ class ExchangePermissionsGUI:
 def main():
     root = tk.Tk()
     
-    # Icon setzen (falls vorhanden)
     try:
         root.iconbitmap('exchange.ico')
     except:
