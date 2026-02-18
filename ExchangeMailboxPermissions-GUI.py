@@ -614,7 +614,7 @@ class ExchangePermissionsGUI:
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction SilentlyContinue
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -ErrorAction SilentlyContinue | Out-Null
-Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -AcceptLicense
+Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber
 $m = Get-Module -ListAvailable -Name ExchangeOnlineManagement
 if ($m) { Write-Output "INSTALL_OK:$($m.Version)" } else { Write-Output "INSTALL_FAILED" }
 """
